@@ -75,3 +75,7 @@ Kill Merveil
 + TRIAL - Spike traps
 - Remember to grab waypoint
 ```
+
+## License
+
+[CC BY-NC 4.0](LICENSE) — Free to use and modify for non-commercial purposes with attribution.
