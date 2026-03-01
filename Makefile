@@ -7,6 +7,7 @@ build:
 # Optimized release build
 release:
 	cargo build --release
+	copy target\release\poe-leveling-guide-rust.exe PoE-Leveling-Guide.exe
 
 # Run debug build
 run:

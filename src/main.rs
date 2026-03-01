@@ -36,6 +36,7 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: vp,
+        multisampling: 0,
         ..Default::default()
     };
 

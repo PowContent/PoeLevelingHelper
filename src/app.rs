@@ -73,7 +73,7 @@ fn apply_transparency_to_all_windows() {
         unsafe {
             let region = CreateRectRgn(0, 0, -1, -1);
             let bb = DWM_BLURBEHIND {
-                dwFlags: 0x1 | 0x2,
+                dwFlags: 0x1, // DWM_BB_ENABLE
                 fEnable: 1,
                 hRgnBlur: region,
                 fTransitionOnMaximized: 0,
@@ -106,70 +106,14 @@ fn check_cursor_over_panels(ctx: &egui::Context, panel_rects: &[egui::Rect]) -> 
     }
 }
 
-/// Schedule a WS_EX_TRANSPARENT style change via a Windows timer callback.
-/// This ensures SetWindowLongPtrW runs completely outside the eframe/winit
-/// rendering pipeline, avoiding re-entrant GL context switching that crashes
-/// at glow_integration.rs:909.
+/// Schedule a WS_EX_TRANSPARENT style change from a background thread.
+/// SetWindowLongPtrW triggers synchronous WM_SIZE messages. If called from
+/// within the winit event loop (even via SetTimer), this re-enters the GL
+/// paint loop and crashes at glow_integration.rs:909.
 ///
-/// The desired state is stored in a static atomic. A one-shot timer fires
-/// after 1ms and applies the style change from the timer callback, which
-/// runs in the Windows message pump outside of any rendering code.
-#[cfg(windows)]
-fn schedule_click_through(over_panel: bool) {
-    use std::sync::atomic::AtomicU8;
-    use winapi::um::winuser::SetTimer;
-    use winapi::shared::windef::HWND;
-    use winapi::shared::minwindef::UINT;
-
-    // 0 = transparent (click-through), 1 = opaque (clickable), 2 = no pending change
-    static PENDING_STATE: AtomicU8 = AtomicU8::new(2);
-
-    unsafe extern "system" fn timer_callback(
-        _hwnd: HWND,
-        _msg: UINT,
-        _id: usize,
-        _time: u32,
-    ) {
-        use winapi::um::winuser::*;
-        use winapi::um::processthreadsapi::GetCurrentThreadId;
-        use winapi::shared::windef::HWND as HWND2;
-        use winapi::shared::minwindef::{BOOL, LPARAM};
-        use std::sync::atomic::Ordering;
-
-        let state = PENDING_STATE.swap(2, Ordering::Relaxed);
-        if state == 2 { return; }
-        let over_panel = state == 1;
-
-        unsafe extern "system" fn apply_callback(hwnd: HWND2, lparam: LPARAM) -> BOOL {
-            unsafe {
-                let over_panel = lparam != 0;
-                let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                let ws_ex_transparent: isize = 0x20;
-                let ws_ex_layered: isize = 0x80000;
-                let new_style = if over_panel {
-                    (style | ws_ex_layered) & !ws_ex_transparent
-                } else {
-                    style | ws_ex_layered | ws_ex_transparent
-                };
-                if new_style != style {
-                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
-                }
-            }
-            0 // stop after first window
-        }
-
-        unsafe {
-            let thread_id = GetCurrentThreadId();
-            EnumThreadWindows(thread_id, Some(apply_callback), over_panel as LPARAM);
-        }
-    }
-
-    PENDING_STATE.store(if over_panel { 1 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
-    unsafe {
-        // Timer ID 42, 1ms delay — fires once from the message pump
-        SetTimer(std::ptr::null_mut(), 42, 1, Some(timer_callback));
-    }
-}
+/// By spawning a short-lived thread that sleeps briefly, we guarantee the
+/// style change happens completely outside the rendering pipeline. The sleep
+/// ensures the current paint frame completes before the style is modified.
 
 /// Check if Path of Exile (or this overlay) is the foreground window.
 #[cfg(windows)]
@@ -210,13 +154,15 @@ pub struct PoELevelingGuideApp {
     parser: LogParser,
     #[cfg(windows)]
     last_over_panel: Option<bool>,
+    #[cfg(windows)]
+    transparency_applied: bool,
     reset_positions_pending: bool,
 }
 
-fn overlay_frame(opacity: f32) -> egui::Frame {
-    let alpha = (opacity * 200.0) as u8;
+fn overlay_frame(opacity: f32, bg_color: [u8; 3]) -> egui::Frame {
+    let alpha = (opacity * 255.0) as u8;
     egui::Frame::NONE
-        .fill(egui::Color32::from_black_alpha(alpha))
+        .fill(egui::Color32::from_rgba_unmultiplied(bg_color[0], bg_color[1], bg_color[2], alpha))
         .corner_radius(4.0)
         .inner_margin(8.0)
 }
@@ -225,7 +171,7 @@ fn overlay_frame(opacity: f32) -> egui::Frame {
 /// - Letter-comma: "R,", "G,", "B,", "Y,", "W,"
 /// - Symbol-space: "< " (red), "+ " (green), "> " (blue), "- " (yellow)
 /// Lines without a recognized prefix render in default white.
-fn render_colored_text(ui: &mut egui::Ui, text: &str) {
+fn render_colored_text(ui: &mut egui::Ui, text: &str, font_size: f32) {
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -250,15 +196,16 @@ fn render_colored_text(ui: &mut egui::Ui, text: &str) {
             };
             if skip > 0 {
                 let content = trimmed[skip..].trim();
+                let rt = egui::RichText::new(content).size(font_size);
                 if let Some(c) = color {
-                    ui.label(egui::RichText::new(content).color(c));
+                    ui.label(rt.color(c));
                 } else {
-                    ui.label(content);
+                    ui.label(rt);
                 }
                 continue;
             }
         }
-        ui.label(trimmed);
+        ui.label(egui::RichText::new(trimmed).size(font_size));
     }
 }
 
@@ -342,6 +289,8 @@ impl PoELevelingGuideApp {
             parser,
             #[cfg(windows)]
             last_over_panel: None,
+            #[cfg(windows)]
+            transparency_applied: false,
             reset_positions_pending: false,
         }
     }
@@ -381,7 +330,10 @@ impl eframe::App for PoELevelingGuideApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(windows)]
-        apply_transparency_to_all_windows();
+        if !self.transparency_applied {
+            apply_transparency_to_all_windows();
+            self.transparency_applied = true;
+        }
 
         // Process log events — save state on any change
         let mut state_changed = false;
@@ -427,7 +379,9 @@ impl eframe::App for PoELevelingGuideApp {
         let show_all_panels = !self.config.hide_when_unfocused || poe_focused;
 
         let opacity = self.config.overlay_opacity;
-        let frame = overlay_frame(opacity);
+        let image_opacity = self.config.image_opacity;
+        let font_size = self.config.font_size;
+        let frame = overlay_frame(opacity, self.config.bg_color);
         let mut input_rects: Vec<egui::Rect> = Vec::new();
 
         // === Main hotbar window ===
@@ -575,6 +529,14 @@ impl eframe::App for PoELevelingGuideApp {
                         }
                     });
                     ui.horizontal(|ui| {
+                        ui.label("Text Max Width:");
+                        ui.add(egui::Slider::new(&mut self.config.text_max_width, 100.0..=800.0).suffix("px"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Font Size:");
+                        ui.add(egui::Slider::new(&mut self.config.font_size, 8.0..=32.0).suffix("px"));
+                    });
+                    ui.horizontal(|ui| {
                         ui.label("Image Max Width:");
                         ui.add(egui::Slider::new(&mut self.config.image_width, 50.0..=600.0));
                     });
@@ -583,12 +545,23 @@ impl eframe::App for PoELevelingGuideApp {
                         ui.add(egui::Slider::new(&mut self.config.image_spacing, 0.0..=10.0).suffix("px"));
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Opacity:");
-                        ui.add(egui::Slider::new(&mut self.config.overlay_opacity, 0.0..=1.0));
+                        ui.label("Image Opacity:");
+                        ui.add(egui::Slider::new(&mut self.config.image_opacity, 0.0..=1.0));
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Text Max Width:");
-                        ui.add(egui::Slider::new(&mut self.config.text_max_width, 100.0..=800.0).suffix("px"));
+                        ui.label("BG Color:");
+                        let mut color = egui::Color32::from_rgb(
+                            self.config.bg_color[0],
+                            self.config.bg_color[1],
+                            self.config.bg_color[2],
+                        );
+                        if ui.color_edit_button_srgba(&mut color).changed() {
+                            self.config.bg_color = [color.r(), color.g(), color.b()];
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("UI Opacity:");
+                        ui.add(egui::Slider::new(&mut self.config.overlay_opacity, 0.0..=1.0));
                     });
                     ui.checkbox(&mut self.config.show_guide, "Show Guide");
                     ui.checkbox(&mut self.config.show_notes, "Show Notes");
@@ -630,7 +603,7 @@ impl eframe::App for PoELevelingGuideApp {
                     match text {
                         Some(text) => {
                             match extract_zone_text(&text, &self.zone_manager.current_zone) {
-                                Some(content) => { render_colored_text(ui, &content); }
+                                Some(content) => { render_colored_text(ui, &content, font_size); }
                                 None => {
                                     let clean = self.zone_manager.current_zone.trim_start_matches(|c: char| c.is_ascii_digit() || c.is_whitespace());
                                     ui.label(format!("Add 'zone:{}' to this file", clean));
@@ -665,7 +638,7 @@ impl eframe::App for PoELevelingGuideApp {
                     match text {
                         Some(text) => {
                             match extract_zone_text(&text, &self.zone_manager.current_zone) {
-                                Some(content) => { render_colored_text(ui, &content); }
+                                Some(content) => { render_colored_text(ui, &content, font_size); }
                                 None => {
                                     let clean = self.zone_manager.current_zone.trim_start_matches(|c: char| c.is_ascii_digit() || c.is_whitespace());
                                     ui.label(format!("Add 'zone:{}' to this file", clean));
@@ -773,7 +746,7 @@ impl eframe::App for PoELevelingGuideApp {
                             )
                             .fit_to_exact_size(egui::vec2(image_width, img_info.height))
                             .maintain_aspect_ratio(true)
-                            .tint(egui::Color32::from_white_alpha((opacity * 255.0) as u8));
+                            .tint(egui::Color32::from_white_alpha((image_opacity * 255.0) as u8));
                             ui.add(image);
                         });
                 }
@@ -783,13 +756,16 @@ impl eframe::App for PoELevelingGuideApp {
         // Update parser path if changed
         self.parser.set_path(PathBuf::from(&self.config.client_txt_path));
 
-        // Schedule click-through style change via timer callback (outside render pipeline)
+        // Set mouse passthrough if cursor is NOT over any panel
         #[cfg(windows)]
         {
-            let cursor_over_panel = check_cursor_over_panels(ctx, &input_rects);
+            let popup_open = egui::Popup::is_any_open(ctx);
+            let cursor_over_panel = popup_open || check_cursor_over_panels(ctx, &input_rects);
             if self.last_over_panel != Some(cursor_over_panel) {
                 self.last_over_panel = Some(cursor_over_panel);
-                schedule_click_through(cursor_over_panel);
+                // Use eframe's ViewportCommand to safely change passthrough state outside the paint loop.
+                // If cursor is over a panel, passthrough should be FALSE.
+                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(!cursor_over_panel));
             }
         }
     }

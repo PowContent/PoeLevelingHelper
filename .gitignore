@@ -1,5 +1,6 @@
 # Build output
 /target
+PoE-Leveling-Guide.exe
 
 # Config and state (generated at runtime)
 config.ini

@@ -29,6 +29,9 @@ pub struct AppConfig {
     pub image_width: f32,
     pub image_spacing: f32,
     pub hide_when_unfocused: bool,
+    pub image_opacity: f32,
+    pub font_size: f32,
+    pub bg_color: [u8; 3],
     pub text_max_width: f32,
     // Crash recovery state
     pub last_zone: String,
@@ -55,6 +58,9 @@ impl Default for AppConfig {
             image_width: 200.0,
             image_spacing: 2.0,
             hide_when_unfocused: true,
+            image_opacity: 0.8,
+            font_size: 14.0,
+            bg_color: [0, 0, 0],
             text_max_width: 400.0,
             last_zone: String::new(),
             last_act: String::new(),
@@ -109,6 +115,28 @@ impl AppConfig {
                 }
                 if let Some(hide) = section.get("HideWhenUnfocused") {
                     config.hide_when_unfocused = hide == "true";
+                }
+                if let Some(v) = section.get("ImageOpacity") {
+                    if let Ok(val) = v.parse::<f32>() {
+                        config.image_opacity = val;
+                    }
+                }
+                if let Some(v) = section.get("FontSize") {
+                    if let Ok(val) = v.parse::<f32>() {
+                        config.font_size = val;
+                    }
+                }
+                if let Some(v) = section.get("BgColor") {
+                    let parts: Vec<&str> = v.split(',').collect();
+                    if parts.len() == 3 {
+                        if let (Ok(r), Ok(g), Ok(b)) = (
+                            parts[0].trim().parse::<u8>(),
+                            parts[1].trim().parse::<u8>(),
+                            parts[2].trim().parse::<u8>(),
+                        ) {
+                            config.bg_color = [r, g, b];
+                        }
+                    }
                 }
                 if let Some(w) = section.get("TextMaxWidth") {
                     if let Ok(v) = w.parse::<f32>() {
@@ -166,6 +194,9 @@ impl AppConfig {
             .set("ImageWidth", self.image_width.to_string())
             .set("ImageSpacing", self.image_spacing.to_string())
             .set("HideWhenUnfocused", if self.hide_when_unfocused { "true" } else { "false" })
+            .set("ImageOpacity", self.image_opacity.to_string())
+            .set("FontSize", self.font_size.to_string())
+            .set("BgColor", format!("{},{},{}", self.bg_color[0], self.bg_color[1], self.bg_color[2]))
             .set("TextMaxWidth", self.text_max_width.to_string());
         ini.with_section(Some("State"))
             .set("LastZone", &self.last_zone)
