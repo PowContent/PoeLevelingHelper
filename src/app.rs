@@ -221,8 +221,10 @@ fn overlay_frame(opacity: f32) -> egui::Frame {
         .inner_margin(8.0)
 }
 
-/// Render text with color codes. Lines starting with "R,", "G,", "B,", "Y," get
-/// colored and the prefix is stripped. Other lines render in default white.
+/// Render text with color codes. Supports two prefix formats:
+/// - Letter-comma: "R,", "G,", "B,", "Y,", "W,"
+/// - Symbol-space: "< " (red), "+ " (green), "> " (blue), "- " (yellow)
+/// Lines without a recognized prefix render in default white.
 fn render_colored_text(ui: &mut egui::Ui, text: &str) {
     for line in text.lines() {
         let trimmed = line.trim();
@@ -230,19 +232,29 @@ fn render_colored_text(ui: &mut egui::Ui, text: &str) {
             ui.add_space(4.0);
             continue;
         }
-        // Check for single-letter color code prefix: X, where X is R/G/B/Y
-        if trimmed.len() >= 2 && trimmed.as_bytes()[1] == b',' {
-            let code = trimmed.as_bytes()[0];
-            let color = match code {
-                b'R' => Some(egui::Color32::from_rgb(255, 80, 80)),
-                b'G' => Some(egui::Color32::from_rgb(80, 255, 80)),
-                b'B' => Some(egui::Color32::from_rgb(100, 150, 255)),
-                b'Y' => Some(egui::Color32::from_rgb(255, 255, 80)),
-                _ => None,
+        if trimmed.len() >= 2 {
+            let bytes = trimmed.as_bytes();
+            let (color, skip) = match (bytes[0], bytes[1]) {
+                // Letter-comma format: R, G, B, Y, W,
+                (b'R', b',') => (Some(egui::Color32::from_rgb(255, 80, 80)), 2),
+                (b'G', b',') => (Some(egui::Color32::from_rgb(80, 255, 80)), 2),
+                (b'B', b',') => (Some(egui::Color32::from_rgb(100, 150, 255)), 2),
+                (b'Y', b',') => (Some(egui::Color32::from_rgb(255, 255, 80)), 2),
+                (b'W', b',') => (None, 2),
+                // Symbol-space format: < + > -
+                (b'<', b' ') => (Some(egui::Color32::from_rgb(255, 80, 80)), 2),
+                (b'+', b' ') => (Some(egui::Color32::from_rgb(80, 255, 80)), 2),
+                (b'>', b' ') => (Some(egui::Color32::from_rgb(100, 150, 255)), 2),
+                (b'-', b' ') => (Some(egui::Color32::from_rgb(255, 255, 80)), 2),
+                _ => (None, 0),
             };
-            if let Some(color) = color {
-                let content = trimmed[2..].trim();
-                ui.label(egui::RichText::new(content).color(color));
+            if skip > 0 {
+                let content = trimmed[skip..].trim();
+                if let Some(c) = color {
+                    ui.label(egui::RichText::new(content).color(c));
+                } else {
+                    ui.label(content);
+                }
                 continue;
             }
         }
