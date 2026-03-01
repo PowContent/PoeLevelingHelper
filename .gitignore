@@ -1,0 +1,19 @@
+# Build output
+/target
+
+# Config and state (generated at runtime)
+config.ini
+
+# User custom notes
+Custom Notes/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
