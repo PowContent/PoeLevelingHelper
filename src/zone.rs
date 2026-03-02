@@ -51,50 +51,53 @@ impl ZoneManager {
         act_str.replace("Act ", "").trim().parse::<u32>().unwrap_or(1)
     }
 
-    pub fn transition_to_zone(&mut self, zone_name: &str) {
+    /// Attempt to transition to a zone by name.
+    /// Returns `true` if the zone was found in the campaign data, `false` otherwise.
+    pub fn transition_to_zone(&mut self, zone_name: &str) -> bool {
         log::debug!("Attempting to transition to zone: '{}'", zone_name);
         if let Some(data) = &self.data {
             let zone_name_lower = zone_name.to_lowercase();
-            
-            // Intelligent zone selection using highest_act
-            let mut ordered_groups: Vec<&ZoneGroup> = Vec::new();
 
-            let is_part2 = self.highest_act >= 6;
-            
-            // 1. Groups matching the current Part (Act 1-5 vs 6-10)
+            // Intelligent zone selection: prioritize acts within 1 of highest_act,
+            // then use the rest as fallback
+            let mut ordered_groups: Vec<&ZoneGroup> = Vec::new();
+            let ha = self.highest_act as i32;
+
+            // 1. Groups within 1 act of highest_act (most likely correct)
             ordered_groups.extend(data.zones.iter().filter(|g| {
-                let act_num = Self::extract_act_number(&g.act);
-                if is_part2 { act_num >= 6 } else { act_num < 6 }
+                let act_num = Self::extract_act_number(&g.act) as i32;
+                (act_num - ha).abs() <= 1
             }));
-            
+
             // 2. The remaining groups as fallback
             ordered_groups.extend(data.zones.iter().filter(|g| {
-                let act_num = Self::extract_act_number(&g.act);
-                if is_part2 { act_num < 6 } else { act_num >= 6 }
+                let act_num = Self::extract_act_number(&g.act) as i32;
+                (act_num - ha).abs() > 1
             }));
 
             for group in ordered_groups {
                 for zone in &group.list {
                     // Strip leading digits and space from JSON zone name
                     let clean_json_zone = zone.trim_start_matches(|c: char| c.is_ascii_digit() || c.is_whitespace()).to_lowercase();
-                    
+
                     // Check if either contains the other
                     if clean_json_zone.contains(&zone_name_lower) || zone_name_lower.contains(&clean_json_zone) {
                         log::info!("Matched zone! Changing from '{}' to '{}' (Act: {})", self.current_zone, zone, group.act);
                         self.current_part = group.part.clone();
                         self.current_act = group.act.clone();
                         self.current_zone = zone.clone();
-                        
+
                         let act_num = Self::extract_act_number(&self.current_act);
                         if act_num > self.highest_act {
                             self.highest_act = act_num;
                         }
-                        
-                        return;
+
+                        return true;
                     }
                 }
             }
             log::warn!("Could not find a match in data.json for zone: '{}'", zone_name);
         }
+        false
     }
 }

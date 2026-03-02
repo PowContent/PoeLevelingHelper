@@ -4,6 +4,7 @@ mod app;
 mod assets;
 mod config;
 mod exp;
+mod ocr;
 mod parser;
 mod zone;
 
@@ -21,8 +22,10 @@ fn load_icon() -> Option<eframe::egui::IconData> {
 }
 
 fn main() -> eframe::Result<()> {
-    // Setup logging
-    env_logger::init();
+    // Setup logging — default to info level for this crate if RUST_LOG is not set
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("poe_leveling_guide_rust=info")
+    ).init();
 
     // Single fullscreen transparent overlay window
     let mut vp = eframe::egui::ViewportBuilder::default()

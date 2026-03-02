@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use crate::config::{AppConfig, WindowRect};
 use crate::parser::{LogParser, LogEvent};
 use crate::zone::ZoneManager;
-use crate::exp::calculate_exp_penalty;
+use crate::exp::{detailed_exp_status, ExpStatus};
 
 /// Get the "Custom Notes" directory path next to the executable.
 fn custom_notes_dir() -> PathBuf {
@@ -150,6 +150,8 @@ pub struct PoELevelingGuideApp {
     zone_manager: ZoneManager,
     player_level: u32,
     monster_level: u32,
+    zone_detected: bool,
+    level_source: &'static str,
     show_settings: bool,
     parser: LogParser,
     #[cfg(windows)]
@@ -157,6 +159,7 @@ pub struct PoELevelingGuideApp {
     #[cfg(windows)]
     transparency_applied: bool,
     reset_positions_pending: bool,
+    ocr_worker: crate::ocr::OcrWorker,
 }
 
 fn overlay_frame(opacity: f32, bg_color: [u8; 3]) -> egui::Frame {
@@ -259,7 +262,13 @@ impl PoELevelingGuideApp {
 
         // Restore crash recovery state
         let player_level = if config.last_player_level > 0 { config.last_player_level } else { 1 };
-        let monster_level = if config.last_monster_level > 0 { config.last_monster_level } else { 1 };
+        // Extract area level from saved zone name prefix (e.g. "13 Southern Forest" → 13)
+        let monster_level = if config.last_monster_level > 0 {
+            config.last_monster_level
+        } else {
+            let lvl_str: String = config.last_zone.chars().take_while(|c| c.is_ascii_digit()).collect();
+            lvl_str.parse::<u32>().unwrap_or(1)
+        };
         if !config.last_act.is_empty() {
             zone_manager.current_act = config.last_act.clone();
         }
@@ -268,6 +277,7 @@ impl PoELevelingGuideApp {
         }
 
         let parser = LogParser::new(PathBuf::from(&config.client_txt_path));
+        let ocr_worker = crate::ocr::OcrWorker::spawn();
 
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = egui::Color32::TRANSPARENT;
@@ -285,6 +295,8 @@ impl PoELevelingGuideApp {
             zone_manager,
             player_level,
             monster_level,
+            zone_detected: true,
+            level_source: "config",
             show_settings: false,
             parser,
             #[cfg(windows)]
@@ -292,6 +304,7 @@ impl PoELevelingGuideApp {
             #[cfg(windows)]
             transparency_applied: false,
             reset_positions_pending: false,
+            ocr_worker,
         }
     }
 
@@ -340,18 +353,50 @@ impl eframe::App for PoELevelingGuideApp {
         for event in self.parser.poll_events() {
             match event {
                 LogEvent::LevelUp { level, .. } => {
+                    log::info!("[Level] Player leveled up to {} (source: Client.txt)", level);
                     self.player_level = level;
                     state_changed = true;
                 }
                 LogEvent::MonsterLevel { level } => {
+                    log::info!("[Level] Monster level {} detected (source: Client.txt 'Generating level')", level);
                     self.monster_level = level;
+                    self.level_source = "log";
                     state_changed = true;
                 }
                 LogEvent::ZoneEntered { zone_name } => {
-                    self.zone_manager.transition_to_zone(&zone_name);
+                    let found = self.zone_manager.transition_to_zone(&zone_name);
+                    self.zone_detected = found;
+
+                    if found {
+                        // Zone recognized — set level from campaign zone data
+                        let level_str: String = self.zone_manager.current_zone
+                            .chars().take_while(|c| c.is_ascii_digit()).collect();
+                        if let Ok(lvl) = level_str.parse::<u32>() {
+                            log::info!("[Level] Area level {} set from zone data for '{}' (source: campaign data)", lvl, zone_name);
+                            self.monster_level = lvl;
+                            self.level_source = "zone_data";
+                        }
+                    } else {
+                        // Zone not in campaign list — keep current level, mark undetected
+                        log::warn!("[Zone] '{}' not found in campaign data — zone not detected", zone_name);
+                        self.zone_manager.current_zone = zone_name.clone();
+                    }
+
+                    // Always trigger OCR to read the actual area level from the game screen
+                    log::info!("[OCR] Triggering screen capture for zone '{}'", zone_name);
+                    self.ocr_worker.trigger();
                     state_changed = true;
                 }
             }
+        }
+
+        // Poll OCR results from background thread
+        if let Some(level) = self.ocr_worker.poll_result() {
+            log::info!("[Level] Area level {} detected (source: OCR screen capture)", level);
+            self.monster_level = level;
+            self.level_source = "ocr";
+            self.zone_detected = true; // OCR confirmed a level, so the zone is valid
+            state_changed = true;
         }
 
         if state_changed {
@@ -397,10 +442,40 @@ impl eframe::App for PoELevelingGuideApp {
             .show(ctx, |ui| {
                 if !self.config.main_hidden {
                     ui.horizontal(|ui| {
-                        let (exp_pct, over) = calculate_exp_penalty(self.player_level, self.monster_level);
                         ui.label("Level:");
-                        ui.add(egui::DragValue::new(&mut self.player_level).range(1..=100));
-                        ui.label(format!("EXP: {:.1}% (Over: {})", exp_pct * 100.0, over));
+                        if ui.add(egui::DragValue::new(&mut self.player_level).range(1..=100)).changed() {
+                            log::info!("[Level] Player level manually set to {}", self.player_level);
+                            self.config.last_player_level = self.player_level;
+                            let _ = self.config.save("config.ini");
+                        }
+
+                        // XP penalty display based on zone detection
+                        if !self.zone_detected {
+                            ui.colored_label(egui::Color32::from_rgb(255, 165, 0), "Zone not detected");
+                        } else {
+                            let status = detailed_exp_status(self.player_level, self.monster_level);
+                            match status {
+                                ExpStatus::UnderLeveled { levels_under, penalty_pct, max_safe_zone } => {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(100, 150, 255),
+                                        format!("A{} | {} under | {:.1}% penalty | Lvl At: {}", self.monster_level, levels_under, penalty_pct, max_safe_zone),
+                                    );
+                                }
+                                ExpStatus::NoPenalty { levels_over_min } => {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(80, 255, 80),
+                                        format!("A{} | No penalty | +{} over min", self.monster_level, levels_over_min),
+                                    );
+                                }
+                                ExpStatus::OverLeveled { penalty_pct } => {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 80, 80),
+                                        format!("A{} | Over-leveled | {:.1}% penalty", self.monster_level, penalty_pct),
+                                    );
+                                }
+                            }
+                        }
+
                         ui.separator();
                         ui.label(&self.zone_manager.current_act);
                         ui.label(&self.zone_manager.current_zone);
@@ -411,6 +486,19 @@ impl eframe::App for PoELevelingGuideApp {
                                 self.zone_manager.highest_act = 1;
                             } else {
                                 self.zone_manager.highest_act = 6;
+                            }
+                            // Re-match current zone against the new part's act data
+                            let current = self.zone_manager.current_zone.clone();
+                            let clean = current.trim_start_matches(|c: char| c.is_ascii_digit() || c.is_whitespace()).to_string();
+                            let found = self.zone_manager.transition_to_zone(&clean);
+                            self.zone_detected = found;
+                            if found {
+                                let level_str: String = self.zone_manager.current_zone
+                                    .chars().take_while(|c| c.is_ascii_digit()).collect();
+                                if let Ok(lvl) = level_str.parse::<u32>() {
+                                    self.monster_level = lvl;
+                                    self.level_source = "zone_data";
+                                }
                             }
                         }
 
@@ -768,5 +856,11 @@ impl eframe::App for PoELevelingGuideApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(!cursor_over_panel));
             }
         }
+    }
+}
+
+impl Drop for PoELevelingGuideApp {
+    fn drop(&mut self) {
+        self.ocr_worker.shutdown();
     }
 }
